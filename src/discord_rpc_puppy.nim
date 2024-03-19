@@ -1,7 +1,8 @@
-import std/[net, os, endians, strutils, options, tables, uri, with, typetraits, macros]
+import std/[net, os, asyncdispatch, endians, strutils, options, tables, uri, with, typetraits, macros]
 when defined(posix):
   from posix import Stat, stat, S_ISSOCK
 import pkg/[jsony, uuids, puppy]
+import discord_rpc_puppy/[asyncipc, asyncpipe]
 
 const
   RPCVersion = 1
@@ -12,7 +13,9 @@ type
     code*: int
 
   DiscordRPC* = ref object
-    socket: Socket
+    ipc: AsyncIpc
+    readHandle: AsyncIpcHandle
+    writeHandle: AsyncIpcHandle
     clientId*: int64
 
   OpCode = enum
@@ -292,7 +295,7 @@ proc existsSocket(s: string): bool =
 
 proc getSocketDir(): string =
   when defined(windows):
-    "\\\\?\\pipe"
+    "\\\\.\\pipe"
   else:
     if existsEnv "XDG_RUNTIME_DIR":
       getEnv "XDG_RUNTIME_DIR"
@@ -318,28 +321,28 @@ func parseOpCode(u: uint32): OpCode =
   else:
     raise newException(CatchableError, "Invalid opcode: " & $u)
 
-proc readUint32(s: Socket): uint32 =
-  assertResult sizeof uint32, s.recv(addr result, sizeof uint32)
+proc readUint32(s: AsyncIpcHandle): uint32 =
+  discard waitFor s.readInto(addr result, sizeof uint32)
   littleEndian32 addr result, addr result
 
-proc readOpCode(s: Socket): OpCode =
+proc readOpCode(s: AsyncIpcHandle): OpCode =
   s.readUint32.parseOpCode
 
-proc readMessage(s: Socket): RpcMessage =
+proc readMessage(s: AsyncIpcHandle): RpcMessage =
   result.opCode = s.readOpCode
   let len = int s.readUint32
-  result.payload = s.recv len
+  discard waitFor s.readInto(result.payload.addr, len)
 
 func toString(u: uint32): string =
   result = newString(4)
   littleEndian32 addr result[0], unsafeAddr u
 
-proc write(s: Socket, m: RpcMessage) =
+proc write(s: AsyncIpcHandle, m: RpcMessage) =
   var payload = newStringOfCap(m.payload.len + 8)
   payload.add m.opCode.uint32.toString
   payload.add m.payload.len.uint32.toString
   payload.add m.payload
-  assertResult payload.len, s.send(unsafeAddr payload[0], payload.len)
+  waitFor s.write(unsafeAddr payload[0], payload.len)
 
 func composeHandshake(id: int64, version: int): string =
   result = newStringOfCap(85)
@@ -688,7 +691,7 @@ func composeCloseActivityRequest(id: int64): string =
   composeSendActivityJoinInvite id
 
 proc send(d: DiscordRPC, msg: RpcMessage) =
-  d.socket.write msg
+  d.writeHandle.write msg
 
 proc send(d: DiscordRPC, command: Command, args = "") =
   let
@@ -745,16 +748,16 @@ proc parseHook[T](s: string, i: var int, v: var Response[T]) =
     parseHook(s, dataStart, v.distinctBase)
 
 proc receiveResponse[T](d: DiscordRPC, t: typedesc[T], opCode = opFrame): T =
-  let resp = d.socket.readMessage
+  let resp = d.readHandle.readMessage
   assert resp.opCode == opCode
   when T isnot void:
     result = T resp.payload.fromJson(Response[T])
 
 proc connect*(d: DiscordRPC): tuple[config: ServerConfig, user: User] =
-  when defined(windows):
-    d.socket.connect getSocketPath()
-  else:
-    d.socket.connectUnix getSocketPath()
+  let ipcPath = getSocketPath()
+  d.ipc = createIpc(ipcPath)
+  d.readHandle = open(ipcPath, sideReader)
+  d.writeHandle = open(ipcPath, sideWriter)
   let payload = composeHandshake(d.clientId, RPCVersion)
   let msg = RpcMessage(opCode: opHandshake, payload: payload)
   d.send msg
@@ -764,8 +767,7 @@ proc connect*(d: DiscordRPC): tuple[config: ServerConfig, user: User] =
   result.user = user
 
 proc newDiscordRPC*(clientId: int64): DiscordRPC =
-  DiscordRPC(socket: newSocket(when defined(windows): AF_INET else: AF_UNIX, protocol = IPPROTO_IP),
-    clientId: clientId)
+  DiscordRPC(clientId: clientId)
 
 proc getOAuth2Token*(code: string, id: int64, secret: string, scopes: openArray[OAuthScope]):
     tuple[accessToken, refreshToken: string]  =
@@ -857,3 +859,13 @@ proc sendActivityJoinInvite*(d: DiscordRPC, id: int64) =
 
 proc closeActivityRequest*(d: DiscordRPC, id: int64) =
   d.send cmdCloseActivityRequest, composeCloseActivityRequest(id)
+
+when isMainModule:
+  const
+    DISCORD_RPC_ID* {.intdefine.} = 997495549823565886
+
+  proc initializeRpc*: DiscordRPC =
+    result = newDiscordRPC DISCORD_RPC_ID
+
+    discard result.connect
+  discard initializeRpc()
